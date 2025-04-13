@@ -4,11 +4,15 @@
 PROJECT_NAME=${1:-data-engineering}
 BUCKETS_LIST="bronze silver gold warehouse temp checkpoints"
 
+SPARK_VERSION=3.5.5
+AIRFLOW_IMAGE=apache/airflow:2.10.5-python3.11
+SPARK_IMAGE=bitnami/spark:3.5.5
 
 ##########################################################################
 
 echo "🛠️ Criando projeto $PROJECT_NAME..."
 
+##############################  PASTAS  ##################################
 # Cria estrutura completa de pastas
 mkdir -p \
   $PROJECT_NAME/airflow/dags \
@@ -32,6 +36,9 @@ mkdir -p \
 # Esta será substituída quando o container Airflow for construído
 TEMPORARY_FERNET_KEY="temporary_key_until_build_"$(date +%s | sha256sum | base64 | head -c 32)
 
+
+###################### ROOT ############################################
+
 # Cria arquivo .env com todas variáveis necessárias
 cat > $PROJECT_NAME/.env <<EOL
 # ===== CORE SETTINGS =====
@@ -49,7 +56,7 @@ MINIO_ROOT_PASSWORD=minioadmin
 MINIO_REGION=us-east-1
 
 # ===== AIRFLOW =====
-AIRFLOW_IMAGE=apache/airflow:2.10.5-python3.13
+AIRFLOW_IMAGE=$AIRFLOW_IMAGE
 AIRFLOW_UID=1000
 AIRFLOW_GID=0
 AIRFLOW__CORE__EXECUTOR=LocalExecutor
@@ -57,7 +64,7 @@ AIRFLOW__CORE__FERNET_KEY=$TEMPORARY_FERNET_KEY
 AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB}
 
 # ===== SPARK =====
-SPARK_VERSION=3.3.0
+SPARK_VERSION=$SPARK_VERSION
 HADOOP_VERSION=3
 
 # ===== STREAMLIT =====
@@ -130,13 +137,30 @@ services:
     env_file: .env
     environment:
       SPARK_MODE: master
+      SPARK_MASTER_HOST: spark-master
     volumes:
       - ./spark/conf:/opt/bitnami/spark/conf
       - ./scripts:/scripts
     ports:
-      - "8081:8080"
-      - "7077:7077"
-      - "4040:4040"
+      - "8081:8080"  # UI do Spark
+      - "7077:7077"  # Porta do cluster
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  spark-worker:
+    build: ./spark  # Mesma imagem do master
+    env_file: .env
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark-master:7077
+    depends_on:
+      - spark-master
+    volumes:
+      - ./spark/conf:/opt/bitnami/spark/conf
+      - ./scripts:/scripts
 
   prometheus:
     image: prom/prometheus
@@ -166,9 +190,11 @@ EOL
 
 echo "✅ compose.yaml criado com sucesso"
 
+########################### AIRFLOW #######################################
+
 # cria o dockerfile do airflow
-cat > $PROJECT_NAME/airflow/Dockerfile <<'EOL'
-FROM apache/airflow:2.10.5-python3.13
+cat > $PROJECT_NAME/airflow/Dockerfile <<EOL
+FROM $AIRFLOW_IMAGE
 
 USER root
 RUN apt-get update && \
@@ -187,7 +213,7 @@ EOL
 echo "✅ Dockerfile - Airflow -  criado com sucesso"
 
 
-cat > $PROJECT_NAME/scripts/init/setup_airflow.sh <<'EOL'
+cat > $PROJECT_NAME/airflow/setup_airflow.sh <<'EOL'
 #!/bin/bash
 echo "⚙️ Configurando Airflow..."
 
@@ -241,6 +267,37 @@ EOL
 
 echo "✅ Requirements - Airflow -  criado com sucesso"
 
+
+########################### SPARK #######################################
+
+# Dockerfile
+cat > $PROJECT_NAME/spark/Dockerfile <<EOL
+FROM $SPARK_IMAGE
+EOL
+
+########################## STREAMLIT ####################################
+
+cat > $PROJECT_NAME/reports/streamlit/Dockerfile <<EOL
+FROM python:3.10-slim
+
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+EOL
+
+# Cria requirements.txt básico para o Streamlit
+cat > $PROJECT_NAME/reports/streamlit/requirements.txt <<EOL
+streamlit==1.44.0
+pandas==2.2.*
+EOL
+
+echo "✅ Dockerfile e requirements - Streamlit - criados com sucesso"
+
 # Cria scripts de inicialização
 cat > $PROJECT_NAME/scripts/init/setup_minio.sh <<EOL
 #!/bin/bash
@@ -263,57 +320,6 @@ mc cp /scripts/sample_data/sample_data.csv minio/bronze/
 
 echo "✅ MinIO configurado com sucesso!"
 EOL
-
-# cat > $PROJECT_NAME/scripts/init/setup_airflow.sh <<EOL
-# #!/bin/bash
-# echo "⚙️ Configurando Airflow para ${PROJECT_NAME}..."
-
-# # Verifica e instala cryptography se necessário
-# if ! python3 -c "import cryptography" &> /dev/null; then
-#     echo "📦 Instalando pacote cryptography..."
-#     pip install cryptography --quiet
-# fi
-
-# # Gera e configura a chave Fernet se não existir
-# if [ -z "${AIRFLOW__CORE__FERNET_KEY}" ]; then
-#     echo "🔑 Gerando chave Fernet..."
-#     export AIRFLOW__CORE__FERNET_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-#     echo "AIRFLOW__CORE__FERNET_KEY=${AIRFLOW__CORE__FERNET_KEY}" >> ../.env
-# fi
-
-# # Aguarda PostgreSQL ficar disponível
-# until (airflow db check); do
-#   echo "🕒 Aguardando PostgreSQL..."
-#   sleep 5
-# done
-
-# # Inicializa o banco de dados
-# echo "💾 Inicializando banco de dados..."
-# airflow db init
-
-# # Cria usuário admin (se não existir)
-# echo "👤 Verificando/Criando usuário admin..."
-# if ! airflow users get --username ${POSTGRES_USER} &> /dev/null; then
-#     airflow users create \
-#         --username ${POSTGRES_USER} \
-#         --password ${POSTGRES_PASSWORD} \
-#         --firstname Admin \
-#         --lastname User \
-#         --role Admin \
-#         --email admin@example.com
-#     echo "✅ Usuário admin criado com sucesso!"
-# else
-#     echo "ℹ️ Usuário admin já existe"
-# fi
-
-# # Configurações adicionais recomendadas
-# airflow variables set setup_complete true
-
-# echo "✅ Airflow configurado com sucesso!"
-
-# EOL
-
-# echo "✅ Script airrflow 2  -  criado com sucesso"
 
 # Configura permissões
 find "$PROJECT_NAME/scripts/init" -name "*.sh" -exec chmod +x {} \;
@@ -338,8 +344,4 @@ Para iniciar:
 1. cd ${PROJECT_NAME}
 2. docker compose up -d --build
 
-Acessos após inicialização:
-• Airflow UI: http://localhost:8080 (admin/airflow)
-• MinIO Console: http://localhost:9001 (minioadmin/minioadmin)
-• Grafana: http://localhost:3000 (admin/admin)
 EOF
