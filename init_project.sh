@@ -2,11 +2,34 @@
 
 ##################### VARIÁVEIS PARA O SCRIPT ############################
 PROJECT_NAME=${1:-data-engineering}
-BUCKETS_LIST="bronze silver gold warehouse temp checkpoints"
 
-SPARK_VERSION=3.5.5
+POSTGRES_VERSION=15
+POSTGRES_USER=airflow
+POSTGRES_PASSWORD=airflow
+POSTGRES_DB=airflow
+
 AIRFLOW_IMAGE=apache/airflow:2.10.5-python3.11
+AIRFLOW_UID=1000
+AIRFLOW_GID=0
+AIRFLOW__CORE__EXECUTOR=LocalExecutor
+AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB}
+TEMPORARY_FERNET_KEY="temporary_key_until_build_"$(date +%s | sha256sum | base64 | head -c 32)
+
 SPARK_IMAGE=bitnami/spark:3.5.5
+SPARK_VERSION=3.5.5
+SPARK_WORKER_MEMORY=2g
+SPARK_DRIVER_MEMORY=1g
+SPARK_EXECUTOR_MEMORY=1g
+
+HADOOP_VERSION=3
+
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=minioadmin
+MINIO_REGION=us-east-1
+BUCKETS_LIST="bronze silver gold"
+
+STREAMLIT_PORT=8501
+
 
 ##########################################################################
 
@@ -33,10 +56,6 @@ mkdir -p \
   $PROJECT_NAME/scripts/init \
   $PROJECT_NAME/scripts/sample_data
 
-# Esta será substituída quando o container Airflow for construído
-TEMPORARY_FERNET_KEY="temporary_key_until_build_"$(date +%s | sha256sum | base64 | head -c 32)
-
-
 ###################### ROOT ############################################
 
 # Cria arquivo .env com todas variáveis necessárias
@@ -45,30 +64,30 @@ cat > $PROJECT_NAME/.env <<EOL
 COMPOSE_PROJECT_NAME=$PROJECT_NAME
 
 # ===== POSTGRESQL =====
-POSTGRES_VERSION=13
-POSTGRES_USER=airflow
-POSTGRES_PASSWORD=airflow
-POSTGRES_DB=airflow
+POSTGRES_VERSION=$POSTGRES_VERSION
+POSTGRES_USER=$POSTGRES_USER
+POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+POSTGRES_DB=$POSTGRES_DB
 
 # ===== MINIO =====
-MINIO_ROOT_USER=minioadmin
-MINIO_ROOT_PASSWORD=minioadmin
-MINIO_REGION=us-east-1
+MINIO_ROOT_USER=$MINIO_ROOT_USER
+MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD
+MINIO_REGION=$MINIO_REGION
 
 # ===== AIRFLOW =====
 AIRFLOW_IMAGE=$AIRFLOW_IMAGE
-AIRFLOW_UID=1000
-AIRFLOW_GID=0
-AIRFLOW__CORE__EXECUTOR=LocalExecutor
+AIRFLOW_UID=$AIRFLOW_UID
+AIRFLOW_GID=$AIRFLOW_GID
+AIRFLOW__CORE__EXECUTOR=$AIRFLOW__CORE__EXECUTOR
 AIRFLOW__CORE__FERNET_KEY=$TEMPORARY_FERNET_KEY
-AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB}
+AIRFLOW__CORE__SQL_ALCHEMY_CONN=$AIRFLOW__CORE__SQL_ALCHEMY_CONN
 
 # ===== SPARK =====
 SPARK_VERSION=$SPARK_VERSION
-HADOOP_VERSION=3
+HADOOP_VERSION=$HADOOP_VERSION
 
 # ===== STREAMLIT =====
-STREAMLIT_PORT=8501
+STREAMLIT_PORT=$STREAMLIT_PORT
 EOL
 
 echo "✅ .ENV criado com sucesso"
@@ -197,17 +216,25 @@ cat > $PROJECT_NAME/airflow/Dockerfile <<EOL
 FROM $AIRFLOW_IMAGE
 
 USER root
-RUN apt-get update && \
-    apt-get install -y openjdk-11-jdk && \
+
+RUN apt-get update && \\
+    apt-get install -y openjdk-17-jdk && \\
+    update-alternatives --set java /usr/lib/jvm/java-17-openjdk-amd64/bin/java && \\
     rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-
 COPY setup_airflow.sh /scripts/setup_airflow.sh
 RUN chmod +x /scripts/setup_airflow.sh
 
 USER airflow
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Volta para root para garantir permissões corretas
+USER root
+RUN chown -R airflow:root /home/airflow/.local
+
+USER airflow
+
 EOL
 
 echo "✅ Dockerfile - Airflow -  criado com sucesso"
@@ -254,14 +281,12 @@ apache-airflow-providers-apache-spark==5.1.*
 apache-airflow-providers-amazon==9.5.*
 
 # Data Processing
-pyspark==3.3.*
+pyspark==3.5.*
 pandas==2.2.*
 pyarrow==19.0.*
 boto3==1.37.*
 selenium==4.31.*
 
-# Data Quality
-great-expectations==1.3.*
 EOL
 
 echo "✅ Requirements - Airflow -  criado com sucesso"
@@ -272,6 +297,32 @@ echo "✅ Requirements - Airflow -  criado com sucesso"
 # Dockerfile
 cat > $PROJECT_NAME/spark/Dockerfile <<EOL
 FROM $SPARK_IMAGE
+# Instala dependências adicionais
+USER root
+RUN apt-get update && \\
+    apt-get install -y curl python3-pip && \\
+    rm -rf /var/lib/apt/lists/*
+
+# Configurações recomendadas para o Spark
+ENV SPARK_WORKER_MEMORY=$SPARK_WORKER_MEMORY
+ENV SPARK_DRIVER_MEMORY=$SPARK_DRIVER_MEMORY
+ENV SPARK_EXECUTOR_MEMORY=$SPARK_EXECUTOR_MEMORY
+EOL
+
+########################  PROMETHEUS  ###################################
+
+cat > $PROJECT_NAME/monitoring/prometheus/prometheus.yaml <<EOL
+global:
+  scrape_interval: 15s
+
+scrape_configs:
+  - job_name: 'spark'
+    static_configs:
+      - targets: ['spark-master:8080']
+  
+  - job_name: 'airflow'
+    static_configs:
+      - targets: ['airflow-webserver:8080']
 EOL
 
 ########################## STREAMLIT ####################################
@@ -297,6 +348,8 @@ EOL
 
 echo "✅ Dockerfile e requirements - Streamlit - criados com sucesso"
 
+#################### SCRIPTS ########################################
+
 # Cria scripts de inicialização
 cat > $PROJECT_NAME/scripts/init/setup_minio.sh <<EOL
 #!/bin/bash
@@ -319,6 +372,48 @@ mc cp /scripts/sample_data/sample_data.csv minio/bronze/
 
 echo "✅ MinIO configurado com sucesso!"
 EOL
+
+cat > $PROJECT_NAME/start_project.sh <<EOL
+#!/bin/bash
+
+echo "🚀 Iniciando projeto $PROJECT_NAME..."
+
+# Verificar se o Docker está rodando
+if ! docker info > /dev/null 2>&1; then
+    echo "❌ O Docker não está rodando. Por favor, inicie o Docker primeiro."
+    exit 1
+fi
+
+# Construir e iniciar os containers
+docker compose up -d --build
+
+# Mensagem de status
+echo -e "\n🛠️ Serviços sendo iniciados...\n"
+
+# Mostrar URLs de acesso
+echo "🔗 URLs de Acesso:"
+echo "- Airflow: http://localhost:8080 (admin:airflow)"
+echo "- MinIO: http://localhost:9001 (minioadmin:minioadmin)"
+echo "- Spark UI: http://localhost:8081"
+echo "- Grafana: http://localhost:3000 (admin:admin)"
+echo "- Streamlit: http://localhost:8501"
+
+echo -e "\n✅ Use 'docker compose logs -f' para ver os logs dos serviços"
+EOL
+
+chmod +x $PROJECT_NAME/start_project.sh
+
+cat > $PROJECT_NAME/stop_project.sh <<EOL
+#!/bin/bash
+
+echo "🛑 Parando projeto $PROJECT_NAME..."
+
+docker compose down
+
+echo "✅ Projeto parado. Use './start_project.sh' para reiniciar."
+EOL
+
+chmod +x $PROJECT_NAME/stop_project.sh
 
 # Configura permissões
 find "$PROJECT_NAME/scripts/init" -name "*.sh" -exec chmod +x {} \;
