@@ -4,6 +4,9 @@
 PROJECT_NAME=${1:-data-engineering}
 BUCKETS_LIST="bronze silver gold warehouse temp checkpoints"
 
+
+##########################################################################
+
 echo "🛠️ Criando projeto $PROJECT_NAME..."
 
 # Cria estrutura completa de pastas
@@ -46,7 +49,7 @@ MINIO_ROOT_PASSWORD=minioadmin
 MINIO_REGION=us-east-1
 
 # ===== AIRFLOW =====
-AIRFLOW_IMAGE=apache/airflow:2.5.1-python3.8
+AIRFLOW_IMAGE=apache/airflow:2.10.5-python3.13
 AIRFLOW_UID=1000
 AIRFLOW_GID=0
 AIRFLOW__CORE__EXECUTOR=LocalExecutor
