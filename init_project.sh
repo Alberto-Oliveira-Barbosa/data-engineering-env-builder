@@ -219,9 +219,8 @@ echo "⚙️ Configurando Airflow..."
 
 # Gera chave Fernet definitiva (agora dentro do container com tudo instalado)
 FERNET_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-sed -i "s/AIRFLOW__CORE__FERNET_KEY=.*/AIRFLOW__CORE__FERNET_KEY=$FERNET_KEY/" ../.env
+sed -i "s|AIRFLOW__CORE__FERNET_KEY=.*|AIRFLOW__CORE__FERNET_KEY=$FERNET_KEY|" /opt/airflow/.env
 
-# Restante do seu script original...
 until (airflow db check); do
   echo "🕒 Aguardando PostgreSQL..."
   sleep 5
