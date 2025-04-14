@@ -12,8 +12,12 @@ AIRFLOW_IMAGE=apache/airflow:2.10.5-python3.11
 AIRFLOW_UID=1000
 AIRFLOW_GID=0
 AIRFLOW__CORE__EXECUTOR=LocalExecutor
-AIRFLOW__CORE__SQL_ALCHEMY_CONN=postgresql+psycopg2://\${POSTGRES_USER}:\${POSTGRES_PASSWORD}@postgres:5432/\${POSTGRES_DB}
-TEMPORARY_FERNET_KEY="temporary_key_until_build_"$(date +%s | sha256sum | base64 | head -c 32)
+AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+AIRFLOW__CORE__LOAD_EXAMPLES=False
+AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=True
+AIRFLOW__SCHEDULER__SCHEDULER_HEARTBEAT_SEC=5
+AIRFLOW__WEBSERVER__WORKERS=2
+TEMPORARY_FERNET_KEY="temporary_key_placeholder"
 
 SPARK_IMAGE=bitnami/spark:3.5.5
 SPARK_VERSION=3.5.5
@@ -80,7 +84,7 @@ AIRFLOW_UID=$AIRFLOW_UID
 AIRFLOW_GID=$AIRFLOW_GID
 AIRFLOW__CORE__EXECUTOR=$AIRFLOW__CORE__EXECUTOR
 AIRFLOW__CORE__FERNET_KEY=$TEMPORARY_FERNET_KEY
-AIRFLOW__CORE__SQL_ALCHEMY_CONN=$AIRFLOW__CORE__SQL_ALCHEMY_CONN
+AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=$AIRFLOW__DATABASE__SQL_ALCHEMY_CONN
 
 # ===== SPARK =====
 SPARK_VERSION=$SPARK_VERSION
@@ -92,7 +96,7 @@ EOL
 
 echo "✅ .ENV criado com sucesso"
 
-# Cria docker compose.yaml completo
+# Cria compose.yaml default
 cat > $PROJECT_NAME/compose.yaml <<'EOL'
 services:
   postgres:
@@ -110,6 +114,8 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+    networks:
+      - data-net
 
   minio:
     image: minio/minio
@@ -121,7 +127,6 @@ services:
     command: server --console-address ":9001" /data
     volumes:
       - ./minio/data:/data
-      - ./scripts:/scripts
     ports:
       - "9000:9000"
       - "9001:9001"
@@ -130,19 +135,23 @@ services:
       interval: 30s
       timeout: 20s
       retries: 3
+    networks:
+      - data-net
 
   airflow-webserver:
     build: ./airflow
     env_file: .env
     environment:
-      AIRFLOW__CORE__SQL_ALCHEMY_CONN: ${AIRFLOW__CORE__SQL_ALCHEMY_CONN}
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    user: "${AIRFLOW_UID}:0"  # Garante que o usuário tenha permissão no container
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins
-      - ./airflow/logs:/opt/airflow/logs
+      - ./airflow/logs:/opt/airflow/logs:z
       - ./airflow/config:/opt/airflow/config
-      - ./scripts:/scripts
     ports:
       - "8080:8080"
     depends_on:
@@ -150,6 +159,14 @@ services:
         condition: service_healthy
       minio:
         condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data-net
 
   spark-master:
     build: ./spark
@@ -159,7 +176,6 @@ services:
       SPARK_MASTER_HOST: spark-master
     volumes:
       - ./spark/conf:/opt/bitnami/spark/conf
-      - ./scripts:/scripts
     ports:
       - "8081:8080"  # UI do Spark
       - "7077:7077"  # Porta do cluster
@@ -168,6 +184,8 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    networks:
+      - data-net
 
   spark-worker:
     build: ./spark  # Mesma imagem do master
@@ -179,7 +197,8 @@ services:
       - spark-master
     volumes:
       - ./spark/conf:/opt/bitnami/spark/conf
-      - ./scripts:/scripts
+    networks:
+      - data-net
 
   prometheus:
     image: prom/prometheus
@@ -187,6 +206,8 @@ services:
       - ./monitoring/prometheus:/etc/prometheus
     ports:
       - "9090:9090"
+    networks:
+      - data-net
 
   grafana:
     image: grafana/grafana
@@ -197,14 +218,37 @@ services:
       - "3000:3000"
     depends_on:
       - prometheus
+    restart: unless-stopped
+    user: "472:472"  # Usuário específico do Grafana
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data-net
 
   streamlit:
     build: ./reports/streamlit
     volumes:
       - ./reports/streamlit:/app
-      - ./scripts:/scripts
     ports:
       - "${STREAMLIT_PORT}:8501"
+    restart: unless-stopped
+    stdin_open: true  # Mantém STDIN aberto
+    tty: true         # Aloca pseudo-TTY
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8501/_stcore/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - data-net
+
+networks:
+  data-net:
+    driver: bridge
+    name: ${COMPOSE_PROJECT_NAME}-net
 EOL
 
 echo "✅ compose.yaml criado com sucesso"
@@ -216,56 +260,78 @@ cat > $PROJECT_NAME/airflow/Dockerfile <<EOL
 FROM $AIRFLOW_IMAGE
 
 USER root
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        python3-dev \
+        libffi-dev \
+        openssl \
+        && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update && \\
-    apt-get install -y openjdk-17-jdk && \\
-    update-alternatives --set java /usr/lib/jvm/java-17-openjdk-amd64/bin/java && \\
-    rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /scripts && \
+    chown -R airflow:root /scripts && \
+    chmod -R 775 /scripts
 
+COPY setup_airflow.sh /scripts/
 COPY requirements.txt .
-COPY setup_airflow.sh /scripts/setup_airflow.sh
+
 RUN chmod +x /scripts/setup_airflow.sh
 
+# Instala dependências como usuário airflow
 USER airflow
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir cryptography==44.0.0 && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Volta para root para garantir permissões corretas
-USER root
-RUN chown -R airflow:root /home/airflow/.local
-
-USER airflow
-
+CMD ["bash", "/scripts/setup_airflow.sh"]
 EOL
 
 echo "✅ Dockerfile - Airflow -  criado com sucesso"
 
 
-cat > $PROJECT_NAME/airflow/setup_airflow.sh <<'EOL'
+cat > $PROJECT_NAME/airflow/setup_airflow.sh <<EOL
 #!/bin/bash
-echo "⚙️ Configurando Airflow..."
+set -e
 
-# Gera chave Fernet definitiva (agora dentro do container com tudo instalado)
-FERNET_KEY=$(python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
-sed -i "s|AIRFLOW__CORE__FERNET_KEY=.*|AIRFLOW__CORE__FERNET_KEY=$FERNET_KEY|" /opt/airflow/.env
+echo "⚙️ Iniciando configuração do Airflow..."
 
-until (airflow db check); do
-  echo "🕒 Aguardando PostgreSQL..."
+export AIRFLOW_HOME=/opt/airflow
+export PATH="/home/airflow/.local/bin:$PATH"
+
+echo "🔧 Instalando dependências..."
+pip install --no-cache-dir cryptography==44.0.0
+
+echo "🔑 Gerando Fernet Key..."
+FERNET_KEY=\$(python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())")
+export AIRFLOW__CORE__FERNET_KEY=\$FERNET_KEY
+
+echo "🕒 Aguardando PostgreSQL..."
+until pg_isready -h postgres -U $POSTGRES_USER -d $POSTGRES_DB -t 1 &>/dev/null; do
+  echo "⏳ Tentativa de conexão com PostgreSQL..."
   sleep 5
 done
+echo "✅ PostgreSQL está disponível"
 
-airflow db init
+airflow db migrate
+
+echo "👤 Verificando/Criando usuário admin..."
 airflow users create \
-  --username ${POSTGRES_USER} \
-  --password ${POSTGRES_PASSWORD} \
+  --username $POSTGRES_USER \
+  --password $POSTGRES_PASSWORD \
   --firstname Admin \
   --lastname User \
   --role Admin \
-  --email admin@example.com
+  --email admin@example.com 
 
-echo "✅ Airflow configurado com chave Fernet definitiva!"
+sleep 3
+
+echo "🚀 Iniciando serviços do Airflow..."
+airflow webserver --port 8080 --daemon &
+exec airflow scheduler
 EOL
 
 echo "✅ Setup_airflow - Airflow -  criado com sucesso"
+
 
 # cria o requirements.txt do airflow
 cat > $PROJECT_NAME/airflow/requirements.txt <<'EOL'
@@ -303,7 +369,7 @@ RUN apt-get update && \\
     apt-get install -y curl python3-pip && \\
     rm -rf /var/lib/apt/lists/*
 
-# Configurações recomendadas para o Spark
+# Configurações para o Spark
 ENV SPARK_WORKER_MEMORY=$SPARK_WORKER_MEMORY
 ENV SPARK_DRIVER_MEMORY=$SPARK_DRIVER_MEMORY
 ENV SPARK_EXECUTOR_MEMORY=$SPARK_EXECUTOR_MEMORY
@@ -311,7 +377,7 @@ EOL
 
 ########################  PROMETHEUS  ###################################
 
-cat > $PROJECT_NAME/monitoring/prometheus/prometheus.yaml <<EOL
+cat > $PROJECT_NAME/monitoring/prometheus/prometheus.yaml <<'EOL'
 global:
   scrape_interval: 15s
 
@@ -332,16 +398,29 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
+# Configuração para evitar reinicializações indesejadas
+ENV STREAMLIT_SERVER_ENABLE_STATIC_SERVING=true
+ENV STREAMLIT_SERVER_ENABLE_CORS=false
+ENV STREAMLIT_SERVER_ENABLE_XSRF_PROTECTION=true
+
+HEALTHCHECK --interval=30s --timeout=10s --retries=3 \
+  CMD curl -f http://localhost:8501/_stcore/health || exit 1
+
 CMD ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
 EOL
 
 # Cria requirements.txt básico para o Streamlit
-cat > $PROJECT_NAME/reports/streamlit/requirements.txt <<EOL
+cat > $PROJECT_NAME/reports/streamlit/requirements.txt <<'EOL'
 streamlit==1.44.0
 pandas==2.2.*
 EOL
@@ -387,21 +466,25 @@ fi
 # Construir e iniciar os containers
 docker compose up -d --build
 
-# Mensagem de status
-echo -e "\n🛠️ Serviços sendo iniciados...\n"
+echo -e "\n⏳ Aguardando inicialização dos serviços (30 segundos)..."
+sleep 30 
+
+# Verificar status
+echo -e "\n\n🔍 Status dos serviços:"
+docker compose ps
 
 # Mostrar URLs de acesso
-echo "🔗 URLs de Acesso:"
-echo "- Airflow: http://localhost:8080 (admin:airflow)"
-echo "- MinIO: http://localhost:9001 (minioadmin:minioadmin)"
+echo -e "\n🔗 URLs de Acesso:"
+echo "- Airflow: http://localhost:8080 ($POSTGRES_USER:$POSTGRES_PASSWORD)"
+echo "- MinIO: http://localhost:9001 ($MINIO_ROOT_USER:$MINIO_ROOT_PASSWORD)"
 echo "- Spark UI: http://localhost:8081"
 echo "- Grafana: http://localhost:3000 (admin:admin)"
 echo "- Streamlit: http://localhost:8501"
 
-echo -e "\n✅ Use 'docker compose logs -f' para ver os logs dos serviços"
+echo -e "\n✅ Use './check_services.sh' para verificar o status dos serviços"
+echo -e "📝 Use 'docker compose logs -f' para ver os logs em tempo real"
 EOL
 
-chmod +x $PROJECT_NAME/start_project.sh
 
 cat > $PROJECT_NAME/stop_project.sh <<EOL
 #!/bin/bash
@@ -413,20 +496,57 @@ docker compose down
 echo "✅ Projeto parado. Use './start_project.sh' para reiniciar."
 EOL
 
-chmod +x $PROJECT_NAME/stop_project.sh
+
+cat > $PROJECT_NAME/check_services.sh <<'EOL'
+#!/bin/bash
+
+services=("postgres" "minio" "airflow-webserver" "spark-master" "grafana" "streamlit")
+
+for service in "${services[@]}"; do
+  container_id=$(docker ps -qf "name=${PROJECT_NAME}-${service}-1")
+  
+  if [ -z "$container_id" ]; then
+    echo "⚠️ Container $service não está em execução. Reiniciando..."
+    docker compose up -d $service
+    sleep 10
+  else
+    echo "✅ $service está rodando (ID: $container_id)"
+  fi
+done
+EOL
+
+
+########################## PERMISSÕES DAS PASTAS ##########################################
 
 # Configura permissões
+chmod +x $PROJECT_NAME/start_project.sh
+chmod +x $PROJECT_NAME/stop_project.sh
+chmod +x $PROJECT_NAME/check_services.sh
 find "$PROJECT_NAME/scripts/init" -name "*.sh" -exec chmod +x {} \;
 
-# Cria arquivo de dados de exemplo
+
+
+
+################################# PLACEHOLDERS ############################################
+
+# Cria arquivo de dados de exemplo para teste do bucket
 echo "id,name,value" > "$PROJECT_NAME/scripts/sample_data/sample_data.csv"
 echo "1,test,100" >> "$PROJECT_NAME/scripts/sample_data/sample_data.csv"
 echo "2,data,200" >> "$PROJECT_NAME/scripts/sample_data/sample_data.csv"
 
-# Mensagem final de sucesso
-cat <<EOF
+# 
+cat > $PROJECT_NAME/reports/streamlit/app.py <<'EOL'
+import streamlit as st
 
-✅ Configurações concluídas com sucesso em '$PROJECT_NAME':
+st.write("Arquivo de exemplo do container streamlit")
+
+EOL
+
+
+############################## MENSAGEM FINAL ###############################################
+
+cat <<EOF
+✅ Configurações concluídas com sucesso em $PROJECT_NAME:
    - Estrutura de pastas completa
    - Arquivos de configuração (.env, compose.yaml)
    - Scripts de inicialização
@@ -435,7 +555,6 @@ cat <<EOF
 🎉 Ambiente pronto para uso!
 
 Para iniciar:
-1. cd ${PROJECT_NAME}
-2. docker compose up -d --build
-
+1. cd $PROJECT_NAME
+2. sh start_project.sh
 EOF
