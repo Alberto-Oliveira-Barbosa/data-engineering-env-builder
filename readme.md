@@ -75,8 +75,6 @@ O script cria automaticamente:
 # Execute o script de criação (opcional: passe o nome do projeto como parâmetro)
 # caso não seja informado um nome, por default ele criará um projeto nomeado data-engineering
 
-./setup_project.sh [nome-do-projeto]
-# ou 
 sh setup_project.sh [nome-do-projeto]
 ```
 ### Personalização

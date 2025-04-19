@@ -77,6 +77,7 @@ POSTGRES_DB=$POSTGRES_DB
 MINIO_ROOT_USER=$MINIO_ROOT_USER
 MINIO_ROOT_PASSWORD=$MINIO_ROOT_PASSWORD
 MINIO_REGION=$MINIO_REGION
+BUCKETS_LIST="$BUCKETS_LIST"
 
 # ===== AIRFLOW =====
 AIRFLOW_IMAGE=$AIRFLOW_IMAGE
@@ -95,6 +96,14 @@ STREAMLIT_PORT=$STREAMLIT_PORT
 EOL
 
 echo "✅ .ENV criado com sucesso"
+
+cat > $PROJECT_NAME/airflow/config/minio.env <<EOL
+MINIO_ROOT_USER=${MINIO_ROOT_USER}
+MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
+BUCKETS_LIST="${BUCKETS_LIST}"
+EOL
+
+echo "✅ minio.env criado com sucesso"
 
 # Cria compose.yaml default
 cat > $PROJECT_NAME/compose.yaml <<'EOL'
@@ -139,19 +148,26 @@ services:
       - data-net
 
   airflow-webserver:
-    build: ./airflow
+    build:
+      context: .  # Pasta raiz do projeto
+      dockerfile: ./airflow/Dockerfile
     env_file: .env
     environment:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN}
       AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW__CORE__FERNET_KEY}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      BUCKETS_LIST: ${BUCKETS_LIST}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
     user: "${AIRFLOW_UID}:0"  # Garante que o usuário tenha permissão no container
     volumes:
       - ./airflow/dags:/opt/airflow/dags
       - ./airflow/plugins:/opt/airflow/plugins
       - ./airflow/logs:/opt/airflow/logs:z
       - ./airflow/config:/opt/airflow/config
+      - ./scripts/init:/scripts
+      - ./scripts/sample_data:/scripts/sample_data
     ports:
       - "8080:8080"
     depends_on:
@@ -211,6 +227,7 @@ services:
 
   grafana:
     image: grafana/grafana
+    user: "472:472"  # Usuário específico do Grafana
     volumes:
       - ./monitoring/grafana:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
@@ -219,7 +236,6 @@ services:
     depends_on:
       - prometheus
     restart: unless-stopped
-    user: "472:472"  # Usuário específico do Grafana
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
       interval: 30s
@@ -260,38 +276,55 @@ cat > $PROJECT_NAME/airflow/Dockerfile <<EOL
 FROM $AIRFLOW_IMAGE
 
 USER root
+
+# Instala dependências do sistema
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         build-essential \
         python3-dev \
         libffi-dev \
         openssl \
+        curl \
+        jq \
         && rm -rf /var/lib/apt/lists/*
 
+# Instala o cliente MinIO
+RUN curl -o /usr/local/bin/mc https://dl.min.io/client/mc/release/linux-amd64/mc && \
+    chmod +x /usr/local/bin/mc && \
+    mkdir -p /scripts/sample_data
+
+# Configura diretórios e permissões
 RUN mkdir -p /scripts && \
     chown -R airflow:root /scripts && \
     chmod -R 775 /scripts
 
-COPY setup_airflow.sh /scripts/
-COPY requirements.txt .
+# Copia arquivos necessários
+COPY ./airflow/requirements.txt .
+COPY ./scripts/init/setup_minio.sh /scripts/init/
+COPY ./scripts/init/setup_airflow.sh /scripts/init/
+COPY ./scripts/sample_data/sample_data.csv /scripts/sample_data/
+COPY ./airflow/config/minio.env /opt/airflow/config/
 
-RUN chmod +x /scripts/setup_airflow.sh
+# Define permissões
+RUN chmod +x /scripts/init/*.sh && \
+    chown -R airflow:root /opt/airflow/config
 
-# Instala dependências como usuário airflow
+# Instala dependências Python
 USER airflow
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir cryptography==44.0.0 && \
     pip install --no-cache-dir -r requirements.txt
 
 CMD ["bash", "/scripts/setup_airflow.sh"]
+
 EOL
 
 echo "✅ Dockerfile - Airflow -  criado com sucesso"
 
 
-cat > $PROJECT_NAME/airflow/setup_airflow.sh <<EOL
+cat > $PROJECT_NAME/scripts/init/setup_airflow.sh <<EOL
 #!/bin/bash
-set -e
+set -ex
 
 echo "⚙️ Iniciando configuração do Airflow..."
 
@@ -312,20 +345,30 @@ until pg_isready -h postgres -U $POSTGRES_USER -d $POSTGRES_DB -t 1 &>/dev/null;
 done
 echo "✅ PostgreSQL está disponível"
 
+echo "⚙️ Configurando MinIO..."
+if [ -f "/scripts/setup_minio.sh" ]; then
+    echo "✅ Script encontrado, executando..."
+    chmod +x /scripts/setup_minio.sh
+    /scripts/setup_minio.sh || echo "⚠️ Falha ao executar setup_minio.sh"
+else
+    echo "❌ ERRO: /scripts/setup_minio.sh não encontrado"
+    ls -la /scripts/
+    exit 1
+fi
+
+echo "🛠️ Inicializando banco de dados..."
 airflow db migrate
 
-echo "👤 Verificando/Criando usuário admin..."
+echo "👤 Criando usuário admin..."
 airflow users create \
   --username $POSTGRES_USER \
   --password $POSTGRES_PASSWORD \
   --firstname Admin \
   --lastname User \
   --role Admin \
-  --email admin@example.com 
+  --email admin@example.com
 
-sleep 3
-
-echo "🚀 Iniciando serviços do Airflow..."
+echo "🚀 Iniciando serviços..."
 airflow webserver --port 8080 --daemon &
 exec airflow scheduler
 EOL
@@ -356,7 +399,6 @@ selenium==4.31.*
 EOL
 
 echo "✅ Requirements - Airflow -  criado com sucesso"
-
 
 ########################### SPARK #######################################
 
@@ -430,27 +472,43 @@ echo "✅ Dockerfile e requirements - Streamlit - criados com sucesso"
 #################### SCRIPTS ########################################
 
 # Cria scripts de inicialização
-cat > $PROJECT_NAME/scripts/init/setup_minio.sh <<EOL
+cat > $PROJECT_NAME/scripts/init/setup_minio.sh <<'EOL'
 #!/bin/bash
-echo "⚙️ Configurando MinIO para "${COMPOSE_PROJECT_NAME}"..."
+set -ex
 
-until (mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD}); do
-  echo "🕒 Aguardando MinIO iniciar..."
-  sleep 2
+echo "⚙️ Configurando MinIO..."
+
+# Carrega variáveis de ambiente
+source /opt/airflow/config/minio.env || echo "⚠️ Não foi possível carregar minio.env"
+
+echo "🔍 Variáveis:"
+echo "MINIO_ROOT_USER=${MINIO_ROOT_USER}"
+echo "BUCKETS_LIST=${BUCKETS_LIST}"
+
+echo "🕒 Aguardando MinIO ficar disponível..."
+while ! curl -f http://minio:9000/minio/health/live; do
+  echo "⏳ Tentando conectar ao MinIO..."
+  sleep 5
 done
+
+echo "🔌 Configurando alias do MinIO..."
+mc alias set minio http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} --api S3v4
 
 echo "🪣 Criando buckets..."
-
-for bucket in $BUCKETS_LIST; do
-  mc mb minio/${bucket} || echo "Bucket ${bucket} já existe"
-  mc policy set public minio/${bucket}
+IFS=" " read -ra buckets <<< "${BUCKETS_LIST}"
+for bucket in "${buckets[@]}"; do
+  echo "Criando bucket: ${bucket}"
+  mc mb minio/${bucket} || echo "⚠️ Bucket ${bucket} já existe ou erro na criação"
+  mc policy set public minio/${bucket} || echo "⚠️ Falha ao definir política"
 done
 
-echo "📤 Upload de dados de exemplo..."
-mc cp /scripts/sample_data/sample_data.csv minio/bronze/
+echo "📤 Enviando arquivo de exemplo..."
+mc cp /scripts/sample_data/sample_data.csv minio/bronze/ || echo "⚠️ Falha no upload"
 
 echo "✅ MinIO configurado com sucesso!"
+mc ls minio/
 EOL
+
 
 cat > $PROJECT_NAME/start_project.sh <<EOL
 #!/bin/bash
@@ -522,9 +580,7 @@ EOL
 chmod +x $PROJECT_NAME/start_project.sh
 chmod +x $PROJECT_NAME/stop_project.sh
 chmod +x $PROJECT_NAME/check_services.sh
-find "$PROJECT_NAME/scripts/init" -name "*.sh" -exec chmod +x {} \;
-
-
+chmod +x $PROJECT_NAME/scripts/init/*.sh
 
 
 ################################# PLACEHOLDERS ############################################
