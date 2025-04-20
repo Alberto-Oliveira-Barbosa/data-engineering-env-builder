@@ -43,6 +43,7 @@ echo "🛠️ Criando projeto $PROJECT_NAME..."
 # Cria estrutura completa de pastas
 mkdir -p \
   $PROJECT_NAME/airflow/dags \
+  $PROJECT_NAME/airflow/dags/src \
   $PROJECT_NAME/airflow/logs \
   $PROJECT_NAME/airflow/plugins \
   $PROJECT_NAME/airflow/config \
@@ -598,6 +599,232 @@ st.write("Arquivo de exemplo do container streamlit")
 
 EOL
 
+cat > $PROJECT_NAME/airflow/dags/dag_minio.py <<EOL
+"""
+### DAG com exemplos de uso do MinIO
+
+DAG que lista todos os buckets disponíveis no servidor MinIO.  
+Gerada pelo template de criação do projeto.
+"""
+
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.utils.trigger_rule import TriggerRule
+from airflow.operators.python import PythonOperator
+
+from src import minio_process as minio_process
+
+default_args = {
+    'owner': '$PROJECT_NAME',
+    'depends_on_past': False,
+    'start_date': datetime(2025, 4, 19),
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+    'tags': ['minio', 'buckets']
+}
+
+with DAG(
+    dag_id='list_minio_buckets',
+    default_args=default_args,
+    schedule_interval=None,
+    catchup=False,
+    doc_md=__doc__,
+    description='DAG para listar buckets no MinIO'
+) as dag:
+
+    list_minio_buckets_with_conn = PythonOperator(
+        task_id='list_minio_buckets_with_conn',
+        python_callable=minio_process.list_minio_buckets_with_conn,
+        provide_context=True
+    )
+
+    list_minio_buckets = PythonOperator(
+        task_id='list_minio_buckets',
+        python_callable=minio_process.list_minio_buckets,
+        provide_context=True,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+    list_bucket_content = PythonOperator(
+        task_id='list_bucket_content',
+        python_callable=minio_process.list_bucket_content,
+        provide_context=True,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+    get_and_upload_bucket_content = PythonOperator(
+        task_id='get_and_upload_bucket_content',
+        python_callable=minio_process.get_and_upload_bucket_content,
+        provide_context=True,
+        trigger_rule=TriggerRule.ALL_DONE,
+    )
+
+
+    list_minio_buckets_with_conn >> list_minio_buckets >> list_bucket_content >> get_and_upload_bucket_content
+
+EOL
+
+cat > $PROJECT_NAME/airflow/dags/src/minio_process.py <<'EOL'
+"""
+Exemplos de conexão com o MinIO, simulando um Datalake local.
+Gerado automaticamente pelo template.
+"""
+
+
+# função auxiliar
+def _get_conn_from_env():
+    """
+    Recupera a conexão gerando um cliente s3
+    com as variáveis do ambiente.
+    """
+    import os
+    import boto3
+    from botocore.client import Config
+    from dotenv import load_dotenv
+
+    load_dotenv()
+    
+    # Configuração do cliente S3 para MinIO
+    try:
+        s3 = boto3.client(
+            's3',
+            endpoint_url='http://minio:9000',  # URL do MinIO
+            aws_access_key_id=os.getenv('MINIO_ROOT_USER'),    # Access Key do MinIO
+            aws_secret_access_key=os.getenv('MINIO_ROOT_PASSWORD'), # Secret Key do MinIO
+            config=Config(signature_version='s3v4'),  # Necessário para MinIO
+            region_name=os.getenv('MINIO_REGION'),  # Pode ser qualquer região (MinIO ignora)
+        )
+    except Exception as e:
+        print(f"Erro ao estabelecer conexão: {str(e)}")
+        raise
+
+    return s3
+
+
+def list_minio_buckets_with_conn(**kwargs):
+    """
+    Faz a conexão com o MinIO usando as credenciais
+    salvas dentro de uma connection do airflow
+    
+    Como Configurar a Connection:
+    Na interface do Airflow selecionar Admin --> Connections 
+     - Connection ID: minio_conn (nome que será referenciado no código)
+     - Connection Type: Amazon Web Services
+     - AWS Access Key ID: Sua Access Key do MinIO (Usuário MinIO)
+     - AWS Secret Access Key: Sua Secret Key do MinIO (Senha MinIO)
+     - Extra: Endpoint do MinIO:
+        {
+            "endpoint_url": "http://minio:9000",
+            "aws_access_key_id": "minioadmin",
+            "aws_secret_access_key": "minioadmin"
+        }
+    """
+    
+    from airflow.exceptions import AirflowSkipException
+    from airflow.providers.amazon.aws.hooks.s3 import S3Hook
+    from botocore.exceptions import NoCredentialsError
+    
+    try:
+        hook = S3Hook(aws_conn_id='minio_conn')
+        client = hook.get_conn()
+        
+        response = client.list_buckets()
+        buckets = response.get('Buckets', [])
+        
+        if buckets:
+            print("Buckets encontrados no MinIO:")
+            for bucket in buckets:
+                print(f"- {bucket['Name']}")
+            return buckets
+        else:
+            print("Nenhum bucket encontrado no MinIO")
+            return []
+    except NoCredentialsError:
+        print("Conexão 'minio_conn' não configurada ou credenciais ausentes")
+        print("Por favor, crie a conexão no Airflow para habilitar esta funcionalidade")
+        raise AirflowSkipException("Pulando para próxima task - conexão MinIO não configurada")
+
+    except Exception as e:
+        print(f"Erro ao listar buckets: {str(e)}")
+        raise
+        
+def list_minio_buckets(**kwargs):
+    """
+    Faz a conexão com o MinIO usando as credenciais 
+    diretamente no código, recuperando do arquivo .env
+    """
+
+    try:
+        s3 = _get_conn_from_env()
+        response = s3.list_buckets()
+        buckets = response.get('Buckets', [])
+        
+        if buckets:
+            print("Buckets encontrados no MinIO:")
+            for bucket in buckets:
+                print(f"- {bucket['Name']}")
+            return buckets
+        else:
+            print("Nenhum bucket encontrado no MinIO")
+            return []
+            
+    except Exception as e:
+        print(f"Erro ao listar buckets: {str(e)}")
+        raise
+
+
+def list_bucket_content(**kwargs):
+    """Lista o conteúdo de um bucket S3"""
+    
+    s3 = _get_conn_from_env()
+    response = s3.list_objects_v2(Bucket='bronze')
+    files = [file for file in response.get('Contents', [])]
+
+    print(files)
+
+
+def get_and_upload_bucket_content(**kwargs):
+    """
+    Recupera o conteúdo de um bucket S3
+    faz transformação nos dados 
+    e salvando em outra camada do S3
+    """
+    import pandas as pd
+    import numpy as np
+    from io import StringIO
+
+    s3 = _get_conn_from_env()
+    response = s3.get_object(Bucket='bronze', Key='sample_data.csv')
+    csv_content = response['Body'].read().decode('utf-8')
+    df = pd.read_csv(StringIO(csv_content))
+    print(f'dataframe vindo da camada bronze: {df.shape}')
+    print(df.head())
+    print('#' * 100)
+
+    # gera novas linhas para simular algum processo de transformação
+    new_rows = pd.DataFrame({
+        'id': range(3, 103),
+        'name': np.random.choice(['A', 'B', 'C', 'D'], 100),
+        'value': np.random.randint(50, 500, 100)
+    })
+    df = pd.concat([df, new_rows], ignore_index=True)
+    df.columns = ['ID', 'NAME', 'VALUE']
+    
+    print(f'Novo dataframe que será salvo na camada silver: {df.shape}')
+    print(df.head())
+    
+    # Converter para CSV em memória
+    csv_buffer = StringIO()
+    df.to_csv(csv_buffer, index=False)
+
+    # salva o df em outro bucket
+    s3.put_object(
+        Bucket='silver',
+        Key='exemplos/arquivo.csv',
+        Body=csv_buffer.getvalue()
+    )
+
+EOL
 
 ############################## MENSAGEM FINAL ###############################################
 
