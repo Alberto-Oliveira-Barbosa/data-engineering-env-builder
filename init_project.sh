@@ -98,14 +98,6 @@ EOL
 
 echo "✅ .ENV criado com sucesso"
 
-cat > $PROJECT_NAME/airflow/config/minio.env <<EOL
-MINIO_ROOT_USER=${MINIO_ROOT_USER}
-MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}
-BUCKETS_LIST="${BUCKETS_LIST}"
-EOL
-
-echo "✅ minio.env criado com sucesso"
-
 # Cria compose.yaml default
 cat > $PROJECT_NAME/compose.yaml <<'EOL'
 services:
@@ -304,7 +296,7 @@ COPY ./airflow/requirements.txt .
 COPY ./scripts/init/setup_minio.sh /scripts/init/
 COPY ./scripts/init/setup_airflow.sh /scripts/init/
 COPY ./scripts/sample_data/sample_data.csv /scripts/sample_data/
-COPY ./airflow/config/minio.env /opt/airflow/config/
+COPY ./airflow/config/ /opt/airflow/config/
 
 # Define permissões
 RUN chmod +x /scripts/init/*.sh && \
@@ -478,9 +470,6 @@ cat > $PROJECT_NAME/scripts/init/setup_minio.sh <<'EOL'
 set -ex
 
 echo "⚙️ Configurando MinIO..."
-
-# Carrega variáveis de ambiente
-source /opt/airflow/config/minio.env || echo "⚠️ Não foi possível carregar minio.env"
 
 echo "🔍 Variáveis:"
 echo "MINIO_ROOT_USER=${MINIO_ROOT_USER}"
