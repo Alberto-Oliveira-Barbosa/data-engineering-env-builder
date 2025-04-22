@@ -34,6 +34,8 @@ BUCKETS_LIST="bronze silver gold"
 
 STREAMLIT_PORT=8501
 
+GRAFANA_IMAGE=grafana/grafana:latest
+
 
 ##########################################################################
 
@@ -55,7 +57,8 @@ mkdir -p \
   $PROJECT_NAME/postgres/data \
   $PROJECT_NAME/postgres/backups \
   $PROJECT_NAME/monitoring/prometheus \
-  $PROJECT_NAME/monitoring/grafana/provisioning/dashboards \
+  $PROJECT_NAME/monitoring/grafana \
+  $PROJECT_NAME/monitoring/grafana/provisioning \
   $PROJECT_NAME/reports/streamlit \
   $PROJECT_NAME/reports/powerbi \
   $PROJECT_NAME/scripts/init \
@@ -220,20 +223,20 @@ services:
 
   grafana:
     image: grafana/grafana
-    user: "472:472"  # Usuário específico do Grafana
+    restart: always
+    user: "0"
+    ports:
+      - 3000:3000
     volumes:
       - ./monitoring/grafana:/var/lib/grafana
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
-    ports:
-      - "3000:3000"
     depends_on:
       - prometheus
-    restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/health || exit 1"]
       interval: 30s
       timeout: 10s
-      retries: 5
+      retries: 5 
     networks:
       - data-net
 
