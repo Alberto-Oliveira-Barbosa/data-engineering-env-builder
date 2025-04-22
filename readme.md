@@ -117,9 +117,7 @@ docker compose logs -f [serviço]
    - Verificar o log do serviço (`docker compose logs -f [serviço]`)
 
 ## Melhorias a serem implementadas
-- Adicionar exemplos de DAGs e jobs Spark
-- Automatizada da criação de buckets no MinIO
 - Adicionar Jupyter Notebook para análise
-- Ajustes na imagem do Grafana/Prometheus
+- Adicionar exemplos de jobs Spark
 - Configurar alertas no Grafana
 - Incluir Kafka para streaming
